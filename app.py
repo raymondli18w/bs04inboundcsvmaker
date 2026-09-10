@@ -222,26 +222,25 @@ def check_address_consistency(df):
     df['Address_Mismatch'] = mismatch_flag
     return df
 
-# =========================
-# ✅ Warehouse consistency check across same Ref#
-# =========================
-def check_warehouse_consistency(df):
-    """Flag rows where the same Sales Order No. (Ref#) has multiple warehouses."""
-    whse_mismatch = []
-    for _, row in df.iterrows():
-        so_no = str(row.get('Sales Order No.', '')).strip()
-        if not so_no:
-            whse_mismatch.append(False)
+def detect_warehouse_splits(df):
+    """
+    Detect Ref#s that appear with multiple warehouses.
+    Returns a dict: { ref#: [whse1, whse2, ...] }
+    Does NOT block — just reports.
+    """
+    splits = {}
+    for ref, group in df.groupby('Sales Order No.'):
+        ref_str = str(ref).strip()
+        if ref_str == '':
             continue
-        same_so = df[df['Sales Order No.'] == so_no]
-        unique_whse = set(
+        unique_whse = sorted(set(
             str(w).strip().upper()
-            for w in same_so['WHSE'].tolist()
+            for w in group['WHSE'].tolist()
             if pd.notna(w) and str(w).strip() != ''
-        )
-        whse_mismatch.append(len(unique_whse) > 1)
-    df['Warehouse_Mismatch'] = whse_mismatch
-    return df
+        ))
+        if len(unique_whse) > 1:
+            splits[ref_str] = unique_whse
+    return splits
 
 # =========================
 # Main Processing Function
@@ -330,26 +329,23 @@ def process_inbound_tsv(raw_text, date_format_hint="auto", custom_format=""):
     if not invalid_date_rows.empty:
         st.warning(f"⚠️ {len(invalid_date_rows)} row(s) have unparseable date and will be skipped.")
 
-    # ✅ Address consistency check
+    # Address consistency check (still blocks)
     df = check_address_consistency(df)
     if df['Address_Mismatch'].any():
         st.error("⚠️ Address mismatch detected!")
         st.dataframe(df[df['Address_Mismatch']][['Sales Order No.', 'Street', 'City', 'state', 'Zip Code', 'Country/Region']])
         return None
 
-    # ✅ Warehouse consistency check (same Ref# must have same warehouse)
-    df = check_warehouse_consistency(df)
-    if df['Warehouse_Mismatch'].any():
-        st.error("⚠️ Warehouse mismatch detected! The same Ref# appears with different warehouses.")
-        bad_refs = df[df['Warehouse_Mismatch']]['Sales Order No.'].unique().tolist()
-        for ref in bad_refs:
-            group = df[df['Sales Order No.'] == ref][['Sales Order No.', 'WHSE']]
-            st.write(f"**Ref# {ref}** has multiple warehouses:")
-            st.dataframe(group)
-        return None
+    # ✅ Warehouse splits — just report, don't block
+    splits = detect_warehouse_splits(df)
+    if splits:
+        st.warning("ℹ️ The following Ref#s have multiple warehouses — they will be output as separate groups (not blocked):")
+        for ref, whses in splits.items():
+            st.write(f"- **Ref# {ref}** → warehouses: {', '.join(whses)}")
 
-    # ✅ Sort/group rows by Ref# so identical orders are consecutive
-    df = df.sort_values(by=['Sales Order No.'], kind='stable').reset_index(drop=True)
+    # ✅ Sort by Ref# AND WHSE → same ref + same warehouse group together.
+    #    Stable sort preserves original order within each group.
+    df = df.sort_values(by=['Sales Order No.', 'WHSE'], kind='stable').reset_index(drop=True)
 
     output_rows = []
     all_cols = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ") + [f"A{chr(i)}" for i in range(ord('A'), ord('Z') + 1)]
@@ -417,8 +413,8 @@ Paste your TSV data below.
 ✅ **`Delivery Date`** auto-fills **Pick Date (E)** and **Delivery Date (AH)**  
 ✅ **CLIENT** auto-fills to **`BS04`** if blank  
 ✅ **Warehouse** auto-fills to **`BLUNDELL2`** if blank  
-✅ **Output is grouped by Ref#** so identical orders appear consecutively  
-✅ **Warehouse mismatch check**: same Ref# must use the same warehouse  
+✅ **Output is grouped by `Ref#` + `Warehouse`** — same ref + same warehouse stay together  
+✅ **Different warehouses for same Ref#** → output as separate groups (not blocked)  
 ✅ **Quantity** appears in **columns W and X**
 """)
 

@@ -223,6 +223,27 @@ def check_address_consistency(df):
     return df
 
 # =========================
+# ✅ Warehouse consistency check across same Ref#
+# =========================
+def check_warehouse_consistency(df):
+    """Flag rows where the same Sales Order No. (Ref#) has multiple warehouses."""
+    whse_mismatch = []
+    for _, row in df.iterrows():
+        so_no = str(row.get('Sales Order No.', '')).strip()
+        if not so_no:
+            whse_mismatch.append(False)
+            continue
+        same_so = df[df['Sales Order No.'] == so_no]
+        unique_whse = set(
+            str(w).strip().upper()
+            for w in same_so['WHSE'].tolist()
+            if pd.notna(w) and str(w).strip() != ''
+        )
+        whse_mismatch.append(len(unique_whse) > 1)
+    df['Warehouse_Mismatch'] = whse_mismatch
+    return df
+
+# =========================
 # Main Processing Function
 # =========================
 def process_inbound_tsv(raw_text, date_format_hint="auto", custom_format=""):
@@ -234,28 +255,25 @@ def process_inbound_tsv(raw_text, date_format_hint="auto", custom_format=""):
 
     df = standardize_headers(df)
 
-    # ✅ REQUIRED: no 'Pick Date' required anymore (Delivery Date can serve it)
+    # ✅ Required columns
     required_cols = ['Sales Order No.', 'Item No.', 'Each Qty', 'WHSE']
     for col in required_cols:
         if col not in df.columns:
             st.error(f"Required column missing: '{col}'")
             return None
 
-    # ✅ At least one date source must exist
     has_pick_date = 'Pick Date' in df.columns
     has_date2 = 'Date2' in df.columns
     if not has_pick_date and not has_date2:
         st.error("Required column missing: 'Pick Date' (or 'Delivery Date' as a fallback)")
         return None
 
-    # ✅ Ensure both Pick Date and Date2 columns exist
     if 'Pick Date' not in df.columns:
         df['Pick Date'] = ''
     if 'Date2' not in df.columns:
         df['Date2'] = ''
 
-    # ✅ Fallback logic: if Pick Date blank, use Delivery Date (Date2)
-    #    and vice versa
+    # Fallback: Delivery Date ↔ Pick Date
     df['Pick Date'] = df.apply(
         lambda r: r['Date2'] if (pd.isna(r['Pick Date']) or str(r['Pick Date']).strip() == '')
                               and not (pd.isna(r['Date2']) or str(r['Date2']).strip() == '')
@@ -269,7 +287,6 @@ def process_inbound_tsv(raw_text, date_format_hint="auto", custom_format=""):
         axis=1
     )
 
-    # ✅ Add optional columns
     optional_cols = [
         'Ship To', 'Ship To Code', 'Ship To Address 2', 'Street', 'City', 'state',
         'Zip Code', 'Country/Region', 'Customer PO', 'Ref 1', 'Ref 2', 'Ref 3',
@@ -281,34 +298,30 @@ def process_inbound_tsv(raw_text, date_format_hint="auto", custom_format=""):
 
     df = fill_blank_rows(df)
 
-    # ✅ Auto-fill CLIENT with BS04 if blank
+    # Auto-fill CLIENT
     df['CLIENT'] = df['CLIENT'].apply(
         lambda x: 'BS04' if pd.isna(x) or str(x).strip() == '' else str(x).strip()
     )
 
-    # ✅ Auto-fill WHSE with 'BLUNDELL2' if blank (normalize case)
+    # Auto-fill WHSE (normalize uppercase)
     df['WHSE'] = df['WHSE'].apply(
         lambda x: 'BLUNDELL2' if pd.isna(x) or str(x).strip() == '' else str(x).strip().upper()
     )
 
     df['Validation Status'] = df.apply(validate_address, axis=1)
 
-    # Parse Pick Date
+    # Parse dates
     if date_format_hint == "custom":
         df['Pick Date Clean'] = df['Pick Date'].apply(
+            lambda x: parse_to_mm_dd_yyyy(x, format_hint="custom", custom_format=custom_format)
+        )
+        df['Date2 Clean'] = df['Date2'].apply(
             lambda x: parse_to_mm_dd_yyyy(x, format_hint="custom", custom_format=custom_format)
         )
     else:
         df['Pick Date Clean'] = df['Pick Date'].apply(
             lambda x: parse_to_mm_dd_yyyy(x, format_hint=date_format_hint)
         )
-
-    # Parse Date2 using same logic
-    if date_format_hint == "custom":
-        df['Date2 Clean'] = df['Date2'].apply(
-            lambda x: parse_to_mm_dd_yyyy(x, format_hint="custom", custom_format=custom_format)
-        )
-    else:
         df['Date2 Clean'] = df['Date2'].apply(
             lambda x: parse_to_mm_dd_yyyy(x, format_hint=date_format_hint)
         )
@@ -317,20 +330,35 @@ def process_inbound_tsv(raw_text, date_format_hint="auto", custom_format=""):
     if not invalid_date_rows.empty:
         st.warning(f"⚠️ {len(invalid_date_rows)} row(s) have unparseable date and will be skipped.")
 
+    # ✅ Address consistency check
     df = check_address_consistency(df)
     if df['Address_Mismatch'].any():
         st.error("⚠️ Address mismatch detected!")
         st.dataframe(df[df['Address_Mismatch']][['Sales Order No.', 'Street', 'City', 'state', 'Zip Code', 'Country/Region']])
         return None
 
+    # ✅ Warehouse consistency check (same Ref# must have same warehouse)
+    df = check_warehouse_consistency(df)
+    if df['Warehouse_Mismatch'].any():
+        st.error("⚠️ Warehouse mismatch detected! The same Ref# appears with different warehouses.")
+        bad_refs = df[df['Warehouse_Mismatch']]['Sales Order No.'].unique().tolist()
+        for ref in bad_refs:
+            group = df[df['Sales Order No.'] == ref][['Sales Order No.', 'WHSE']]
+            st.write(f"**Ref# {ref}** has multiple warehouses:")
+            st.dataframe(group)
+        return None
+
+    # ✅ Sort/group rows by Ref# so identical orders are consecutive
+    df = df.sort_values(by=['Sales Order No.'], kind='stable').reset_index(drop=True)
+
     output_rows = []
     all_cols = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ") + [f"A{chr(i)}" for i in range(ord('A'), ord('Z') + 1)]
 
     for _, row in df.iterrows():
-        so_val      = row.get('Sales Order No.', '')   # Ref#
-        item_val    = row.get('Item No.', '')          # Sku Code
-        qty_val     = row.get('Each Qty', '')          # Qty
-        whse_val    = row.get('WHSE', '')              # Warehouse
+        so_val      = row.get('Sales Order No.', '')
+        item_val    = row.get('Item No.', '')
+        qty_val     = row.get('Each Qty', '')
+        whse_val    = row.get('WHSE', '')
         date_val    = row['Pick Date Clean']
         is_addr_valid = (row['Validation Status'] == "Valid")
 
@@ -347,9 +375,9 @@ def process_inbound_tsv(raw_text, date_format_hint="auto", custom_format=""):
             out_row = {col: '' for col in all_cols}
             out_row['A'] = 'BC'
             out_row['B'] = trim_text(row.get('CLIENT', 'BS04'), 10)
-            out_row['C'] = trim_text(row['Sales Order No.'], 30)   # Ref#
+            out_row['C'] = trim_text(row['Sales Order No.'], 30)
             out_row['D'] = trim_text(row.get('Customer PO', ''), 30)
-            out_row['E'] = date_val  # Pick Date → E
+            out_row['E'] = date_val
             out_row['G'] = trim_text(row.get('Ship To Code', ''), 10)
             out_row['H'] = trim_text(row.get('Ship To', ''), 45)
             out_row['J'] = trim_text(row.get('Street', ''), 30)
@@ -360,13 +388,13 @@ def process_inbound_tsv(raw_text, date_format_hint="auto", custom_format=""):
             out_row['O'] = trim_text(row.get('Country/Region', ''), 10)
             out_row['P'] = trim_text(row.get('Carrier Code', ''), 10)
             out_row['Q'] = trim_text(row.get('Carrier Name', ''), 20)
-            out_row['R'] = trim_text(row.get('WHSE', ''), 10)      # Warehouse
+            out_row['R'] = trim_text(row.get('WHSE', ''), 10)
             out_row['S'] = trim_text(row.get('Ref 1', ''), 30)
             out_row['T'] = trim_text(row.get('Ref 2', ''), 30)
             out_row['U'] = trim_text(row.get('Ref 3', ''), 30)
-            out_row['V'] = trim_text(row['Item No.'], 20)          # Sku Code
-            out_row['W'] = trim_text(row['Each Qty'], 10)          # Qty
-            out_row['X'] = trim_text(row['Each Qty'], 10)          # Qty
+            out_row['V'] = trim_text(row['Item No.'], 20)
+            out_row['W'] = trim_text(row['Each Qty'], 10)
+            out_row['X'] = trim_text(row['Each Qty'], 10)
             date2_clean = row.get('Date2 Clean', None)
             out_row['AH'] = date2_clean if date2_clean is not None else ''
             output_rows.append(out_row)
@@ -385,12 +413,13 @@ def process_inbound_tsv(raw_text, date_format_hint="auto", custom_format=""):
 st.title("Inbound TSV to CSV Converter")
 st.markdown("""
 Paste your TSV data below.  
-✅ **Required fields**: `Ref#` (Sales Order), `Sku Code` (Item No.), `Qty`, `Warehouse`, and a date  
+✅ **Required fields**: `Ref#`, `Sku Code`, `Qty`, `Warehouse`, and a date  
 ✅ **`Delivery Date`** auto-fills **Pick Date (E)** and **Delivery Date (AH)**  
 ✅ **CLIENT** auto-fills to **`BS04`** if blank  
 ✅ **Warehouse** auto-fills to **`BLUNDELL2`** if blank  
-✅ **Quantity** appears in **columns W and X**  
-✅ **Date formats** like `12DEC2025`, `12-DEC-25` fully supported
+✅ **Output is grouped by Ref#** so identical orders appear consecutively  
+✅ **Warehouse mismatch check**: same Ref# must use the same warehouse  
+✅ **Quantity** appears in **columns W and X**
 """)
 
 raw_data = st.text_area("Paste your TSV data here:", height=300)

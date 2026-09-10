@@ -4,7 +4,7 @@ from io import StringIO
 from datetime import datetime
 
 # =========================
-# Column synonyms mapping (updated with Ref#, Sku Code, Delivery Date)
+# Column synonyms mapping
 # =========================
 COLUMN_SYNONYMS = {
     'Sales Order No.': [
@@ -108,7 +108,7 @@ def validate_address(row):
     return "Valid"
 
 # =========================
-# Enhanced Date Parser (with MON support)
+# Enhanced Date Parser
 # =========================
 def parse_to_mm_dd_yyyy(date_input, format_hint="auto", custom_format=""):
     if pd.isna(date_input) or str(date_input).strip() == '':
@@ -234,17 +234,46 @@ def process_inbound_tsv(raw_text, date_format_hint="auto", custom_format=""):
 
     df = standardize_headers(df)
 
-    # ✅ CLIENT no longer required (auto-fills BS04)
-    required_cols = ['Sales Order No.', 'Item No.', 'Each Qty', 'WHSE', 'Pick Date']
+    # ✅ REQUIRED: no 'Pick Date' required anymore (Delivery Date can serve it)
+    required_cols = ['Sales Order No.', 'Item No.', 'Each Qty', 'WHSE']
     for col in required_cols:
         if col not in df.columns:
             st.error(f"Required column missing: '{col}'")
             return None
 
+    # ✅ At least one date source must exist
+    has_pick_date = 'Pick Date' in df.columns
+    has_date2 = 'Date2' in df.columns
+    if not has_pick_date and not has_date2:
+        st.error("Required column missing: 'Pick Date' (or 'Delivery Date' as a fallback)")
+        return None
+
+    # ✅ Ensure both Pick Date and Date2 columns exist
+    if 'Pick Date' not in df.columns:
+        df['Pick Date'] = ''
+    if 'Date2' not in df.columns:
+        df['Date2'] = ''
+
+    # ✅ Fallback logic: if Pick Date blank, use Delivery Date (Date2)
+    #    and vice versa
+    df['Pick Date'] = df.apply(
+        lambda r: r['Date2'] if (pd.isna(r['Pick Date']) or str(r['Pick Date']).strip() == '')
+                              and not (pd.isna(r['Date2']) or str(r['Date2']).strip() == '')
+                  else r['Pick Date'],
+        axis=1
+    )
+    df['Date2'] = df.apply(
+        lambda r: r['Pick Date'] if (pd.isna(r['Date2']) or str(r['Date2']).strip() == '')
+                                and not (pd.isna(r['Pick Date']) or str(r['Pick Date']).strip() == '')
+                   else r['Date2'],
+        axis=1
+    )
+
+    # ✅ Add optional columns
     optional_cols = [
         'Ship To', 'Ship To Code', 'Ship To Address 2', 'Street', 'City', 'state',
         'Zip Code', 'Country/Region', 'Customer PO', 'Ref 1', 'Ref 2', 'Ref 3',
-        'Carrier Code', 'Carrier Name', 'Date2', 'CLIENT'
+        'Carrier Code', 'Carrier Name', 'CLIENT'
     ]
     for col in optional_cols:
         if col not in df.columns:
@@ -255,6 +284,11 @@ def process_inbound_tsv(raw_text, date_format_hint="auto", custom_format=""):
     # ✅ Auto-fill CLIENT with BS04 if blank
     df['CLIENT'] = df['CLIENT'].apply(
         lambda x: 'BS04' if pd.isna(x) or str(x).strip() == '' else str(x).strip()
+    )
+
+    # ✅ Auto-fill WHSE with 'BLUNDELL2' if blank (normalize case)
+    df['WHSE'] = df['WHSE'].apply(
+        lambda x: 'BLUNDELL2' if pd.isna(x) or str(x).strip() == '' else str(x).strip().upper()
     )
 
     df['Validation Status'] = df.apply(validate_address, axis=1)
@@ -269,7 +303,7 @@ def process_inbound_tsv(raw_text, date_format_hint="auto", custom_format=""):
             lambda x: parse_to_mm_dd_yyyy(x, format_hint=date_format_hint)
         )
 
-    # Parse Date2 (Delivery Date) using same logic
+    # Parse Date2 using same logic
     if date_format_hint == "custom":
         df['Date2 Clean'] = df['Date2'].apply(
             lambda x: parse_to_mm_dd_yyyy(x, format_hint="custom", custom_format=custom_format)
@@ -281,7 +315,7 @@ def process_inbound_tsv(raw_text, date_format_hint="auto", custom_format=""):
 
     invalid_date_rows = df[df['Pick Date Clean'].isna() & df['Pick Date'].notna()]
     if not invalid_date_rows.empty:
-        st.warning(f"⚠️ {len(invalid_date_rows)} row(s) have unparseable 'Pick Date' and will be skipped.")
+        st.warning(f"⚠️ {len(invalid_date_rows)} row(s) have unparseable date and will be skipped.")
 
     df = check_address_consistency(df)
     if df['Address_Mismatch'].any():
@@ -296,7 +330,6 @@ def process_inbound_tsv(raw_text, date_format_hint="auto", custom_format=""):
         so_val      = row.get('Sales Order No.', '')   # Ref#
         item_val    = row.get('Item No.', '')          # Sku Code
         qty_val     = row.get('Each Qty', '')          # Qty
-        client_val  = row.get('CLIENT', 'BS04')
         whse_val    = row.get('WHSE', '')              # Warehouse
         date_val    = row['Pick Date Clean']
         is_addr_valid = (row['Validation Status'] == "Valid")
@@ -332,10 +365,8 @@ def process_inbound_tsv(raw_text, date_format_hint="auto", custom_format=""):
             out_row['T'] = trim_text(row.get('Ref 2', ''), 30)
             out_row['U'] = trim_text(row.get('Ref 3', ''), 30)
             out_row['V'] = trim_text(row['Item No.'], 20)          # Sku Code
-            # ✅ W and X both = Each Qty (Qty)
-            out_row['W'] = trim_text(row['Each Qty'], 10)
-            out_row['X'] = trim_text(row['Each Qty'], 10)
-            # ✅ Date2 / Delivery Date → AH (optional)
+            out_row['W'] = trim_text(row['Each Qty'], 10)          # Qty
+            out_row['X'] = trim_text(row['Each Qty'], 10)          # Qty
             date2_clean = row.get('Date2 Clean', None)
             out_row['AH'] = date2_clean if date2_clean is not None else ''
             output_rows.append(out_row)
@@ -354,10 +385,11 @@ def process_inbound_tsv(raw_text, date_format_hint="auto", custom_format=""):
 st.title("Inbound TSV to CSV Converter")
 st.markdown("""
 Paste your TSV data below.  
-✅ **Required fields**: `Ref#` (Sales Order), `Sku Code` (Item No.), `Qty`, `Warehouse`, `Pick Date`  
+✅ **Required fields**: `Ref#` (Sales Order), `Sku Code` (Item No.), `Qty`, `Warehouse`, and a date  
+✅ **`Delivery Date`** auto-fills **Pick Date (E)** and **Delivery Date (AH)**  
 ✅ **CLIENT** auto-fills to **`BS04`** if blank  
+✅ **Warehouse** auto-fills to **`BLUNDELL2`** if blank  
 ✅ **Quantity** appears in **columns W and X**  
-✅ **Delivery Date** → output to **column AH**  
 ✅ **Date formats** like `12DEC2025`, `12-DEC-25` fully supported
 """)
 
@@ -365,7 +397,7 @@ raw_data = st.text_area("Paste your TSV data here:", height=300)
 
 st.markdown("### 📅 Date Format Handling")
 date_format_option = st.selectbox(
-    "How should dates in the 'Pick Date' column be interpreted?",
+    "How should dates be interpreted?",
     options=[
         "Auto-detect (recommended)",
         "MM/DD/YYYY",

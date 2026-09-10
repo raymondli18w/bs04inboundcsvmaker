@@ -4,26 +4,27 @@ from io import StringIO
 from datetime import datetime
 
 # =========================
-# Column synonyms mapping (updated with Date2)
+# Column synonyms mapping (updated with Ref#, Sku Code, Delivery Date)
 # =========================
 COLUMN_SYNONYMS = {
     'Sales Order No.': [
         'sales order no', 'sales order number', 'hdr', 'hdr ref', 'po ref', 'order',
         'header reference', 'header ref', 'po number', 'ref', 'reference', 'so no',
-        'po', 'order no', 'sales order'
+        'po', 'order no', 'sales order', 'ref#', 'ref #', 'ref no', 'ref number'
     ],
     'Pick Date': [
         'pick date', 'date picked', 'ship date', 'date ship', 'order date', 'date',
         'receipt date', 'date to ship', 'date shipped', 'pickdate'
     ],
     'Item No.': [
-        'item no', 'item number', 'product', 'sku', 'item', 'product code', 'Item No'
+        'item no', 'item number', 'product', 'sku', 'item', 'product code', 'Item No',
+        'sku code', 'sku#', 'sku no', 'sku number', 'item code'
     ],
     'Each Qty': [
         'each qty', 'quantity', 'qty', 'units'
     ],
     'WHSE': [
-        'whse', 'warehouse', 'warehouse code', 'Whse'
+        'whse', 'warehouse', 'warehouse code', 'Whse', 'warehouse no'
     ],
     'Ship To': [
         'ship to', 'recipient', 'consign', 'name', 'to', 'customer name'
@@ -131,7 +132,6 @@ def parse_to_mm_dd_yyyy(date_input, format_hint="auto", custom_format=""):
         "DD/MON/YY (e.g., 12/DEC/25)": "%d/%b/%y",
     }
 
-    # Custom format
     if format_hint == "custom":
         try:
             dt = datetime.strptime(date_str, custom_format)
@@ -139,7 +139,6 @@ def parse_to_mm_dd_yyyy(date_input, format_hint="auto", custom_format=""):
         except (ValueError, TypeError):
             return None
 
-    # Named format from dropdown
     if format_hint in format_map:
         fmt = format_map[format_hint]
         try:
@@ -150,7 +149,6 @@ def parse_to_mm_dd_yyyy(date_input, format_hint="auto", custom_format=""):
         except ValueError:
             return None
 
-    # Auto-detect
     if format_hint == "auto":
         auto_formats = [
             "%m/%d/%Y", "%m-%d-%Y", "%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y",
@@ -236,22 +234,29 @@ def process_inbound_tsv(raw_text, date_format_hint="auto", custom_format=""):
 
     df = standardize_headers(df)
 
-    required_cols = ['Sales Order No.', 'Item No.', 'Each Qty', 'CLIENT', 'WHSE', 'Pick Date']
+    # ✅ CLIENT no longer required (auto-fills BS04)
+    required_cols = ['Sales Order No.', 'Item No.', 'Each Qty', 'WHSE', 'Pick Date']
     for col in required_cols:
         if col not in df.columns:
             st.error(f"Required column missing: '{col}'")
             return None
 
-    # Add Date2 as optional
     optional_cols = [
-        'Ship To', 'Ship To Code', 'Ship To Address 2', 'Street', 'City', 'state', 'Zip Code', 'Country/Region',
-        'Customer PO', 'Ref 1', 'Ref 2', 'Ref 3', 'Carrier Code', 'Carrier Name', 'Date2'
+        'Ship To', 'Ship To Code', 'Ship To Address 2', 'Street', 'City', 'state',
+        'Zip Code', 'Country/Region', 'Customer PO', 'Ref 1', 'Ref 2', 'Ref 3',
+        'Carrier Code', 'Carrier Name', 'Date2', 'CLIENT'
     ]
     for col in optional_cols:
         if col not in df.columns:
             df[col] = ''
 
     df = fill_blank_rows(df)
+
+    # ✅ Auto-fill CLIENT with BS04 if blank
+    df['CLIENT'] = df['CLIENT'].apply(
+        lambda x: 'BS04' if pd.isna(x) or str(x).strip() == '' else str(x).strip()
+    )
+
     df['Validation Status'] = df.apply(validate_address, axis=1)
 
     # Parse Pick Date
@@ -264,7 +269,7 @@ def process_inbound_tsv(raw_text, date_format_hint="auto", custom_format=""):
             lambda x: parse_to_mm_dd_yyyy(x, format_hint=date_format_hint)
         )
 
-    # Parse Date2 using same logic
+    # Parse Date2 (Delivery Date) using same logic
     if date_format_hint == "custom":
         df['Date2 Clean'] = df['Date2'].apply(
             lambda x: parse_to_mm_dd_yyyy(x, format_hint="custom", custom_format=custom_format)
@@ -288,11 +293,11 @@ def process_inbound_tsv(raw_text, date_format_hint="auto", custom_format=""):
     all_cols = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ") + [f"A{chr(i)}" for i in range(ord('A'), ord('Z') + 1)]
 
     for _, row in df.iterrows():
-        so_val      = row.get('Sales Order No.', '')
-        item_val    = row.get('Item No.', '')
-        qty_val     = row.get('Each Qty', '')
-        client_val  = row.get('CLIENT', '')
-        whse_val    = row.get('WHSE', '')
+        so_val      = row.get('Sales Order No.', '')   # Ref#
+        item_val    = row.get('Item No.', '')          # Sku Code
+        qty_val     = row.get('Each Qty', '')          # Qty
+        client_val  = row.get('CLIENT', 'BS04')
+        whse_val    = row.get('WHSE', '')              # Warehouse
         date_val    = row['Pick Date Clean']
         is_addr_valid = (row['Validation Status'] == "Valid")
 
@@ -300,7 +305,6 @@ def process_inbound_tsv(raw_text, date_format_hint="auto", custom_format=""):
             pd.notna(so_val) and str(so_val).strip() != '',
             pd.notna(item_val) and str(item_val).strip() != '',
             pd.notna(qty_val) and str(qty_val).strip() != '',
-            pd.notna(client_val) and str(client_val).strip() != '',
             pd.notna(whse_val) and str(whse_val).strip() != '',
             date_val is not None,
             is_addr_valid
@@ -309,8 +313,8 @@ def process_inbound_tsv(raw_text, date_format_hint="auto", custom_format=""):
         if valid:
             out_row = {col: '' for col in all_cols}
             out_row['A'] = 'BC'
-            out_row['B'] = trim_text(row.get('CLIENT', ''), 10)
-            out_row['C'] = trim_text(row['Sales Order No.'], 30)
+            out_row['B'] = trim_text(row.get('CLIENT', 'BS04'), 10)
+            out_row['C'] = trim_text(row['Sales Order No.'], 30)   # Ref#
             out_row['D'] = trim_text(row.get('Customer PO', ''), 30)
             out_row['E'] = date_val  # Pick Date → E
             out_row['G'] = trim_text(row.get('Ship To Code', ''), 10)
@@ -323,15 +327,15 @@ def process_inbound_tsv(raw_text, date_format_hint="auto", custom_format=""):
             out_row['O'] = trim_text(row.get('Country/Region', ''), 10)
             out_row['P'] = trim_text(row.get('Carrier Code', ''), 10)
             out_row['Q'] = trim_text(row.get('Carrier Name', ''), 20)
-            out_row['R'] = trim_text(row.get('WHSE', ''), 10)
+            out_row['R'] = trim_text(row.get('WHSE', ''), 10)      # Warehouse
             out_row['S'] = trim_text(row.get('Ref 1', ''), 30)
             out_row['T'] = trim_text(row.get('Ref 2', ''), 30)
             out_row['U'] = trim_text(row.get('Ref 3', ''), 30)
-            out_row['V'] = trim_text(row['Item No.'], 20)
-            # ✅ W and X both = Each Qty (as requested)
+            out_row['V'] = trim_text(row['Item No.'], 20)          # Sku Code
+            # ✅ W and X both = Each Qty (Qty)
             out_row['W'] = trim_text(row['Each Qty'], 10)
             out_row['X'] = trim_text(row['Each Qty'], 10)
-            # ✅ Date2 → AH (optional)
+            # ✅ Date2 / Delivery Date → AH (optional)
             date2_clean = row.get('Date2 Clean', None)
             out_row['AH'] = date2_clean if date2_clean is not None else ''
             output_rows.append(out_row)
@@ -350,9 +354,10 @@ def process_inbound_tsv(raw_text, date_format_hint="auto", custom_format=""):
 st.title("Inbound TSV to CSV Converter")
 st.markdown("""
 Paste your TSV data below.  
-✅ **Required fields**: `Sales Order`, `Item No.`, `Qty`, `CLIENT`, `WHSE`, `Pick Date`  
+✅ **Required fields**: `Ref#` (Sales Order), `Sku Code` (Item No.), `Qty`, `Warehouse`, `Pick Date`  
+✅ **CLIENT** auto-fills to **`BS04`** if blank  
 ✅ **Quantity** appears in **columns W and X**  
-✅ **Optional `Date2`** → output to **column AH**  
+✅ **Delivery Date** → output to **column AH**  
 ✅ **Date formats** like `12DEC2025`, `12-DEC-25` fully supported
 """)
 
